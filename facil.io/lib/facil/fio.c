@@ -341,7 +341,20 @@ static inline int fio_clear_fd(intptr_t fd, uint8_t is_open) {
   return 0;
 }
 
+/* A `poll`/`epoll_wait` result set is a SNAPSHOT copied into user space. By the
+ * time the review loop reaches entry `i`, another thread may already have closed
+ * that descriptor -- and the OS may have handed the number straight back out to
+ * an unrelated socket or file opened elsewhere in the process.
+ *
+ * `uuid_is_valid()` cannot catch that: callers build the uuid with `fd2uuid(fd)`
+ * from the raw descriptor in the event, and that re-reads the descriptor's
+ * CURRENT counter, so the uuid always validates. Gate on `.open` instead -- the
+ * flag that says facil.io owns this descriptor right now, and the same one
+ * `fio_is_closed()` already checks. Without it, a stale error event closes a
+ * descriptor belonging to someone else. */
 static inline void fio_force_close_in_poll(intptr_t uuid) {
+  if (!uuid_data(uuid).open)
+    return;
   uuid_data(uuid).close = 2;
   fio_force_close(uuid);
 }
