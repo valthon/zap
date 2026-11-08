@@ -2066,6 +2066,13 @@ static size_t fio_poll(void) {
       const intptr_t uuid = uuids[i];
       if (!uuid_is_valid(uuid) || !uuid_data(uuid).open)
         continue;
+      /* Keep the slot stable while consuming this registration. A close/reuse
+       * after the outer check must not remove the replacement's watchers. */
+      fio_lock(&fd_data(i).protocol_lock);
+      if (!uuid_is_valid(uuid) || !uuid_data(uuid).open) {
+        fio_unlock(&fd_data(i).protocol_lock);
+        continue;
+      }
       touchfd(i);
       ++count;
       if (list[i].revents & FIO_POLL_WRITE_EVENTS) {
@@ -2078,6 +2085,7 @@ static size_t fio_poll(void) {
         fio_poll_remove_read(i);
         fio_defer_push_task(deferred_on_data, (void *)uuid, NULL);
       }
+      fio_unlock(&fd_data(i).protocol_lock);
       if (list[i].revents & (POLLHUP | POLLERR)) {
         // FIO_LOG_DEBUG("Poll Hangup %zu => %p", i, (void *)uuid);
         fio_force_close_in_poll(uuid);

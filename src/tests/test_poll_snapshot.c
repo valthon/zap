@@ -1,5 +1,6 @@
 /* Exercise production poll review after the kernel has copied an event batch.
- * Interpose only the wait syscall to force a real descriptor-reuse interleaving. */
+ * Interpose wait syscalls and the fallback registration-consumption lock boundary
+ * to force real descriptor-reuse interleavings. */
 #define FIO_MAX_SOCK_CAPACITY 1024
 #ifndef FIO_ENGINE_POLL
 #define FIO_ENGINE_POLL 0
@@ -11,7 +12,11 @@
 #else
 #define kevent snapshot_kevent
 #endif
+#include "../../facil.io/lib/facil/fio.h"
+static void snapshot_lock(fio_lock_i *lock);
+#define fio_lock snapshot_lock
 #include "../../facil.io/lib/facil/fio.c"
+#undef fio_lock
 #undef poll
 #undef epoll_wait
 #undef kevent
@@ -23,6 +28,25 @@ static enum scenario scenario;
 static intptr_t retired_uuid, replacement_uuid;
 static int retired_fd, replacement[2], inject;
 static void replace_after_snapshot(void);
+static int late_reuse, late_wait_returned, late_boundary_seen, late_slot_locked;
+
+/* The fallback remove-read/write helpers acquire fio_data->lock after the
+ * event's outer identity check. Interpose that exact boundary: an unprotected
+ * slot can be retired/reused here; a held slot lock excludes that interleaving. */
+static void snapshot_lock(fio_lock_i *lock) {
+#if FIO_ENGINE_POLL
+  if (late_reuse && late_wait_returned && lock == &fio_data->lock) {
+    late_reuse = 0;
+    late_boundary_seen = 1;
+    late_slot_locked = fd_data(retired_fd).protocol_lock != 0;
+    if (!late_slot_locked) {
+      replace_after_snapshot();
+      fio_poll_add(replacement[0]);
+    }
+  }
+#endif
+  fio_lock(lock);
+}
 
 #if FIO_ENGINE_EPOLL
 extern int epoll_wait(int, struct epoll_event *, int, int);
@@ -47,6 +71,8 @@ int snapshot_kevent(int queue, const struct snapshot_kevent *changes, int count,
 extern int poll(struct pollfd *, nfds_t, int);
 int snapshot_poll(struct pollfd *events, nfds_t count, int timeout) {
   int ready = poll(events, count, timeout);
+  if (late_reuse && ready > 0)
+    late_wait_returned = 1;
   if (inject && ready > 0)
     replace_after_snapshot();
   return ready;
@@ -231,6 +257,42 @@ static void valid_queued_controls(void) {
   }
 }
 
+static int fallback_watchers_survive_late_reuse(void) {
+#if FIO_ENGINE_POLL
+  int retired[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, retired) == 0);
+  retired_fd = retired[0];
+  retired_uuid = fio_fd2uuid(retired_fd);
+  fio_poll_add(retired_fd);
+  assert(write(retired[1], "x", 1) == 1);
+  fio_defer_clear_queue();
+  scenario = READ_EVENT;
+  inject = 0;
+  late_reuse = 1;
+  late_wait_returned = late_boundary_seen = late_slot_locked = 0;
+  fio_poll();
+  assert(late_boundary_seen);
+  /* When the slot is protected, retirement can complete only after review
+   * releases its lock. Otherwise the wrapper already replaced it mid-review. */
+  if (late_slot_locked) {
+    replace_after_snapshot();
+    fio_poll_add(replacement[0]);
+  }
+  const short expected = FIO_POLL_READ_EVENTS | FIO_POLL_WRITE_EVENTS;
+  int failed = fio_data->snapshot_poll[replacement[0]].fd != replacement[0] ||
+      fio_data->snapshot_poll[replacement[0]].events != expected;
+  if (failed)
+    fprintf(stderr, "late reuse stripped replacement watchers: events=%d expected=%d\n",
+            fio_data->snapshot_poll[replacement[0]].events, expected);
+  fio_defer_clear_queue();
+  fio_force_close(replacement_uuid);
+  close(replacement[1]); close(retired[1]);
+  return failed;
+#else
+  return 0;
+#endif
+}
+
 int main(void) {
   int failed = 0;
   for (int kind = RESET; kind <= EXTERNAL_FD; ++kind)
@@ -239,6 +301,7 @@ int main(void) {
   for (int kind = QUEUED_READY; kind <= QUEUED_IO; ++kind)
     failed |= queued_after_reuse((enum queued_kind)kind);
   valid_queued_controls();
+  failed |= fallback_watchers_survive_late_reuse();
   fprintf(stderr, "%s poll snapshot regression: %s\n", fio_engine(), failed ? "FAIL" : "PASS");
   return failed;
 }
