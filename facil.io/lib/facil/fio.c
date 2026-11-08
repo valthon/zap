@@ -341,22 +341,46 @@ static inline int fio_clear_fd(intptr_t fd, uint8_t is_open) {
   return 0;
 }
 
-/* A `poll`/`epoll_wait` result set is a SNAPSHOT copied into user space. By the
- * time the review loop reaches entry `i`, another thread may already have closed
- * that descriptor -- and the OS may have handed the number straight back out to
- * an unrelated socket or file opened elsewhere in the process.
- *
- * `uuid_is_valid()` cannot catch that: callers build the uuid with `fd2uuid(fd)`
- * from the raw descriptor in the event, and that re-reads the descriptor's
- * CURRENT counter, so the uuid always validates. Gate on `.open` instead -- the
- * flag that says facil.io owns this descriptor right now, and the same one
- * `fio_is_closed()` already checks. Without it, a stale error event closes a
- * descriptor belonging to someone else. */
+/* A returned poll batch can outlive its connection. Keep the registration's
+ * UUID in the event rather than deriving a new UUID from a recycled descriptor.
+ * The ownership check also protects descriptors opened outside facil.io. */
+static void fio_discard_pending_packets(intptr_t uuid) {
+  fio_packet_s *packet = NULL;
+  fio_lock(&uuid_data(uuid).sock_lock);
+  packet = uuid_data(uuid).packet;
+  uuid_data(uuid).packet = NULL;
+  uuid_data(uuid).packet_last = &uuid_data(uuid).packet;
+  uuid_data(uuid).sent = 0;
+  fio_unlock(&uuid_data(uuid).sock_lock);
+  while (packet) {
+    fio_packet_s *tmp = packet;
+    packet = packet->next;
+    fio_packet_free(tmp);
+  }
+}
+
 static inline void fio_force_close_in_poll(intptr_t uuid) {
-  if (!uuid_data(uuid).open)
+  const intptr_t fd = fio_uuid2fd(uuid);
+  if (uuid < 0 || (uintptr_t)fd >= fio_data->capa)
     return;
-  uuid_data(uuid).close = 2;
-  fio_force_close(uuid);
+  /* Hold the slot until close: checking identity and then setting a flag could
+   * otherwise mark a connection accepted between those two operations. */
+  fio_lock(&fd_data(fd).protocol_lock);
+  if (!fio_is_valid(uuid) || !fd_data(fd).open) {
+    fio_unlock(&fd_data(fd).protocol_lock);
+    return;
+  }
+  fd_data(fd).close = 2;
+  fio_discard_pending_packets(uuid);
+  fio_clear_fd(fd, 0);
+#if FIO_ENGINE_POLL
+  fio_data->poll[fd].fd = -1;
+  fio_data->poll[fd].events = 0;
+#endif
+  close(fd);
+  fio_unlock(&fd_data(fd).protocol_lock);
+  if (fio_data->connection_count)
+    fio_atomic_sub(&fio_data->connection_count, 1);
 }
 
 /* *****************************************************************************
@@ -367,11 +391,19 @@ Protocol Locking and UUID validation
 #define prt_meta(prt) (((union protocol_metadata_union_u *)(&(prt)->rsv))->meta)
 
 /** locks a connection's protocol returns a pointer that need to be unlocked. */
-inline static fio_protocol_s *protocol_try_lock(intptr_t fd,
+inline static fio_protocol_s *protocol_try_lock(intptr_t uuid,
                                                 enum fio_protocol_lock_e type) {
   errno = 0;
+  if (!fio_is_valid(uuid))
+    goto invalid;
+  const intptr_t fd = fio_uuid2fd(uuid);
   if (fio_trylock(&fd_data(fd).protocol_lock))
     goto would_block;
+  /* The descriptor can be recycled while this task waits for its lock. */
+  if (!fio_is_valid(uuid) || !uuid_data(uuid).open) {
+    fio_unlock(&fd_data(fd).protocol_lock);
+    goto invalid;
+  }
   fio_protocol_s *pr = fd_data(fd).protocol;
   if (!pr) {
     fio_unlock(&fd_data(fd).protocol_lock);
@@ -409,7 +441,7 @@ fio_protocol_s *fio_protocol_try_lock(intptr_t uuid,
     errno = EBADF;
     return NULL;
   }
-  return protocol_try_lock(fio_uuid2fd(uuid), type);
+  return protocol_try_lock(uuid, type);
 }
 
 /* public API. */
@@ -1689,14 +1721,14 @@ static inline int fio_poll_add2(int fd, uint32_t events, int ep_fd) {
     errno = 0;
     chevent = (struct epoll_event){
         .events = events,
-        .data.fd = fd,
+        .data.u64 = (uint64_t)fd2uuid(fd),
     };
     ret = epoll_ctl(ep_fd, EPOLL_CTL_MOD, fd, &chevent);
     if (ret == -1 && errno == ENOENT) {
       errno = 0;
       chevent = (struct epoll_event){
           .events = events,
-          .data.fd = fd,
+          .data.u64 = (uint64_t)fd2uuid(fd),
       };
       ret = epoll_ctl(ep_fd, EPOLL_CTL_ADD, fd, &chevent);
     }
@@ -1746,18 +1778,21 @@ static size_t fio_poll(void) {
         epoll_wait(internal[j].data.fd, events, FIO_POLL_MAX_EVENTS, 0);
     if (active_count > 0) {
       for (int i = 0; i < active_count; i++) {
+        const intptr_t uuid = (intptr_t)events[i].data.u64;
+        if (!uuid_is_valid(uuid) || !uuid_data(uuid).open)
+          continue;
         if (events[i].events & (~(EPOLLIN | EPOLLOUT))) {
           // errors are hendled as disconnections (on_close)
-          fio_force_close_in_poll(fd2uuid(events[i].data.fd));
+          fio_force_close_in_poll(uuid);
         } else {
           // no error, then it's an active event(s)
           if (events[i].events & EPOLLOUT) {
             fio_defer_push_urgent(deferred_on_ready,
-                                  (void *)fd2uuid(events[i].data.fd), NULL);
+                                  (void *)uuid, NULL);
           }
           if (events[i].events & EPOLLIN)
             fio_defer_push_task(deferred_on_data,
-                                (void *)fd2uuid(events[i].data.fd), NULL);
+                                (void *)uuid, NULL);
         }
       } // end for loop
       total += active_count;
@@ -1824,7 +1859,7 @@ static void fio_poll_init(void) {
 static inline void fio_poll_add_read(intptr_t fd) {
   struct kevent chevent[1];
   EV_SET(chevent, fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR | EV_ONESHOT,
-         0, 0, ((void *)fd));
+         0, 0, ((void *)fd2uuid(fd)));
   do {
     errno = 0;
     kevent(evio_fd, chevent, 1, NULL, 0, NULL);
@@ -1835,7 +1870,7 @@ static inline void fio_poll_add_read(intptr_t fd) {
 static inline void fio_poll_add_write(intptr_t fd) {
   struct kevent chevent[1];
   EV_SET(chevent, fd, EVFILT_WRITE, EV_ADD | EV_ENABLE | EV_CLEAR | EV_ONESHOT,
-         0, 0, ((void *)fd));
+         0, 0, ((void *)fd2uuid(fd)));
   do {
     errno = 0;
     kevent(evio_fd, chevent, 1, NULL, 0, NULL);
@@ -1846,9 +1881,9 @@ static inline void fio_poll_add_write(intptr_t fd) {
 static inline void fio_poll_add(intptr_t fd) {
   struct kevent chevent[2];
   EV_SET(chevent, fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR | EV_ONESHOT,
-         0, 0, ((void *)fd));
+         0, 0, ((void *)fd2uuid(fd)));
   EV_SET(chevent + 1, fd, EVFILT_WRITE,
-         EV_ADD | EV_ENABLE | EV_CLEAR | EV_ONESHOT, 0, 0, ((void *)fd));
+         EV_ADD | EV_ENABLE | EV_CLEAR | EV_ONESHOT, 0, 0, ((void *)fd2uuid(fd)));
   do {
     errno = 0;
     kevent(evio_fd, chevent, 2, NULL, 0, NULL);
@@ -1883,16 +1918,19 @@ static size_t fio_poll(void) {
 
   if (active_count > 0) {
     for (int i = 0; i < active_count; i++) {
+      const intptr_t uuid = (intptr_t)events[i].udata;
+      if (!uuid_is_valid(uuid) || !uuid_data(uuid).open)
+        continue;
       // test for event(s) type
       if (events[i].filter == EVFILT_WRITE) {
         fio_defer_push_urgent(deferred_on_ready,
-                              ((void *)fd2uuid(events[i].udata)), NULL);
+                              ((void *)uuid), NULL);
       } else if (events[i].filter == EVFILT_READ) {
-        fio_defer_push_task(deferred_on_data, (void *)fd2uuid(events[i].udata),
+        fio_defer_push_task(deferred_on_data, (void *)uuid,
                             NULL);
       }
       if (events[i].flags & (EV_EOF | EV_ERROR)) {
-        fio_force_close_in_poll(fd2uuid(events[i].udata));
+        fio_force_close_in_poll(uuid);
       }
     }
   } else if (active_count < 0) {
@@ -1998,6 +2036,7 @@ static size_t fio_poll(void) {
   size_t end = fio_data->capa; // max_protocol_fd might break TLS
   size_t start = 0;
   struct pollfd *list = NULL;
+  intptr_t *uuids = NULL;
   fio_lock(&fio_data->lock);
   while (start < end && fio_data->poll[start].fd == -1)
     ++start;
@@ -2006,8 +2045,11 @@ static size_t fio_poll(void) {
   if (start != end) {
     /* copy poll list for multi-threaded poll */
     list = fio_malloc(sizeof(struct pollfd) * end);
+    uuids = fio_malloc(sizeof(*uuids) * end);
     memcpy(list + start, fio_data->poll + start,
            (sizeof(struct pollfd)) * (end - start));
+    for (size_t i = start; i < end; ++i)
+      uuids[i] = fd2uuid(i);
   }
   fio_unlock(&fio_data->lock);
 
@@ -2021,33 +2063,38 @@ static size_t fio_poll(void) {
   }
   for (size_t i = start; i < end; ++i) {
     if (list[i].revents) {
+      const intptr_t uuid = uuids[i];
+      if (!uuid_is_valid(uuid) || !uuid_data(uuid).open)
+        continue;
       touchfd(i);
       ++count;
       if (list[i].revents & FIO_POLL_WRITE_EVENTS) {
-        // FIO_LOG_DEBUG("Poll Write %zu => %p", i, (void *)fd2uuid(i));
+        // FIO_LOG_DEBUG("Poll Write %zu => %p", i, (void *)uuid);
         fio_poll_remove_write(i);
-        fio_defer_push_urgent(deferred_on_ready, (void *)fd2uuid(i), NULL);
+        fio_defer_push_urgent(deferred_on_ready, (void *)uuid, NULL);
       }
       if (list[i].revents & FIO_POLL_READ_EVENTS) {
-        // FIO_LOG_DEBUG("Poll Read %zu => %p", i, (void *)fd2uuid(i));
+        // FIO_LOG_DEBUG("Poll Read %zu => %p", i, (void *)uuid);
         fio_poll_remove_read(i);
-        fio_defer_push_task(deferred_on_data, (void *)fd2uuid(i), NULL);
+        fio_defer_push_task(deferred_on_data, (void *)uuid, NULL);
       }
       if (list[i].revents & (POLLHUP | POLLERR)) {
-        // FIO_LOG_DEBUG("Poll Hangup %zu => %p", i, (void *)fd2uuid(i));
-        fio_poll_remove_fd(i);
-        fio_force_close_in_poll(fd2uuid(i));
+        // FIO_LOG_DEBUG("Poll Hangup %zu => %p", i, (void *)uuid);
+        fio_force_close_in_poll(uuid);
       }
       if (list[i].revents & POLLNVAL) {
-        // FIO_LOG_DEBUG("Poll Invalid %zu => %p", i, (void *)fd2uuid(i));
-        fio_poll_remove_fd(i);
+        // FIO_LOG_DEBUG("Poll Invalid %zu => %p", i, (void *)uuid);
         fio_lock(&fd_data(i).protocol_lock);
-        fio_clear_fd(i, 0);
+        if (uuid_is_valid(uuid) && uuid_data(uuid).open) {
+          fio_poll_remove_fd(i);
+          fio_clear_fd(i, 0);
+        }
         fio_unlock(&fd_data(i).protocol_lock);
       }
     }
   }
 finish:
+  fio_free(uuids);
   fio_free(list);
   return count;
 }
@@ -2144,17 +2191,27 @@ postpone:
 }
 
 static void deferred_on_shutdown(void *arg, void *arg2) {
-  if (!uuid_data(arg).protocol) {
-    return;
-  }
-  fio_protocol_s *pr = protocol_try_lock(fio_uuid2fd(arg), FIO_PR_LOCK_TASK);
+  fio_protocol_s *pr = protocol_try_lock((intptr_t)arg, FIO_PR_LOCK_TASK);
   if (!pr) {
     if (errno == EBADF)
       return;
     goto postpone;
   }
+  fio_lock(&uuid_data(arg).protocol_lock);
+  if (!uuid_is_valid((intptr_t)arg) || !uuid_data(arg).open) {
+    fio_unlock(&uuid_data(arg).protocol_lock);
+    protocol_unlock(pr, FIO_PR_LOCK_TASK);
+    return;
+  }
   touchfd(fio_uuid2fd(arg));
+  fio_unlock(&uuid_data(arg).protocol_lock);
   uint8_t r = pr->on_shutdown ? pr->on_shutdown((intptr_t)arg, pr) : 0;
+  fio_lock(&uuid_data(arg).protocol_lock);
+  if (!uuid_is_valid((intptr_t)arg) || !uuid_data(arg).open) {
+    fio_unlock(&uuid_data(arg).protocol_lock);
+    protocol_unlock(pr, FIO_PR_LOCK_TASK);
+    return;
+  }
   if (r) {
     if (r == 255) {
       uuid_data(arg).timeout = 0;
@@ -2163,11 +2220,13 @@ static void deferred_on_shutdown(void *arg, void *arg2) {
       uuid_data(arg).timeout = r;
     }
     pr->ping = mock_ping2;
+    fio_unlock(&uuid_data(arg).protocol_lock);
     protocol_unlock(pr, FIO_PR_LOCK_TASK);
   } else {
     fio_atomic_add(&fio_data->connection_count, 1);
     uuid_data(arg).timeout = 8;
     pr->ping = mock_ping;
+    fio_unlock(&uuid_data(arg).protocol_lock);
     protocol_unlock(pr, FIO_PR_LOCK_TASK);
     fio_close((intptr_t)arg);
   }
@@ -2179,7 +2238,7 @@ postpone:
 
 static void deferred_on_ready_usr(void *arg, void *arg2) {
   errno = 0;
-  fio_protocol_s *pr = protocol_try_lock(fio_uuid2fd(arg), FIO_PR_LOCK_WRITE);
+  fio_protocol_s *pr = protocol_try_lock((intptr_t)arg, FIO_PR_LOCK_WRITE);
   if (!pr) {
     if (errno == EBADF)
       return;
@@ -2193,16 +2252,32 @@ postpone:
   (void)arg2;
 }
 
+/* Rearming must not derive a replacement connection's UUID from an old fd. */
+static void deferred_poll_rearm(intptr_t uuid, int write_event, int mark_scheduled) {
+  if (!uuid_is_valid(uuid))
+    return;
+  fio_lock(&uuid_data(uuid).protocol_lock);
+  if (uuid_is_valid(uuid) && uuid_data(uuid).open) {
+    if (write_event)
+      fio_poll_add_write(fio_uuid2fd(uuid));
+    else if (!mark_scheduled || !fio_trylock(&uuid_data(uuid).scheduled))
+      fio_poll_add_read(fio_uuid2fd(uuid));
+  }
+  fio_unlock(&uuid_data(uuid).protocol_lock);
+}
+
 static void deferred_on_ready(void *arg, void *arg2) {
+  if (!uuid_is_valid((intptr_t)arg) || !uuid_data(arg).open)
+    return;
   errno = 0;
   if (fio_flush((intptr_t)arg) > 0 || errno == EWOULDBLOCK || errno == EAGAIN) {
     if (arg2)
       fio_defer_push_urgent(deferred_on_ready, arg, NULL);
     else
-      fio_poll_add_write(fio_uuid2fd(arg));
+      deferred_poll_rearm((intptr_t)arg, 1, 0);
     return;
   }
-  if (!uuid_data(arg).protocol) {
+  if (!uuid_is_valid((intptr_t)arg) || !uuid_data(arg).open || !uuid_data(arg).protocol) {
     return;
   }
 
@@ -2215,19 +2290,24 @@ static void deferred_on_data(void *uuid, void *arg2) {
   }
   if (!uuid_data(uuid).protocol)
     goto no_protocol;
-  fio_protocol_s *pr = protocol_try_lock(fio_uuid2fd(uuid), FIO_PR_LOCK_TASK);
+  fio_protocol_s *pr = protocol_try_lock((intptr_t)uuid, FIO_PR_LOCK_TASK);
   if (!pr) {
     if (errno == EBADF) {
       return;
     }
     goto postpone;
   }
+  fio_lock(&uuid_data(uuid).protocol_lock);
+  if (!uuid_is_valid((intptr_t)uuid) || !uuid_data(uuid).open) {
+    fio_unlock(&uuid_data(uuid).protocol_lock);
+    protocol_unlock(pr, FIO_PR_LOCK_TASK);
+    return;
+  }
   fio_unlock(&uuid_data(uuid).scheduled);
+  fio_unlock(&uuid_data(uuid).protocol_lock);
   pr->on_data((intptr_t)uuid, pr);
   protocol_unlock(pr, FIO_PR_LOCK_TASK);
-  if (!fio_trylock(&uuid_data(uuid).scheduled)) {
-    fio_poll_add_read(fio_uuid2fd((intptr_t)uuid));
-  }
+  deferred_poll_rearm((intptr_t)uuid, 0, 1);
   return;
 
 postpone:
@@ -2236,7 +2316,7 @@ postpone:
     fio_defer_push_task(deferred_on_data, (void *)uuid, (void *)1);
   } else {
     /* the protocol was locked, so there might not be any need for the event */
-    fio_poll_add_read(fio_uuid2fd((intptr_t)uuid));
+    deferred_poll_rearm((intptr_t)uuid, 0, 0);
   }
   return;
 
@@ -2247,15 +2327,21 @@ no_protocol:
 }
 
 static void deferred_ping(void *arg, void *arg2) {
-  if (!uuid_data(arg).protocol ||
+  fio_protocol_s *pr = protocol_try_lock((intptr_t)arg, FIO_PR_LOCK_WRITE);
+  if (!pr) {
+    if (errno == EBADF)
+      return;
+    goto postpone;
+  }
+  fio_lock(&uuid_data(arg).protocol_lock);
+  const int skip = !uuid_is_valid((intptr_t)arg) || !uuid_data(arg).open ||
       (uuid_data(arg).timeout &&
-       (uuid_data(arg).timeout + uuid_data(arg).active >
-        (fio_data->last_cycle.tv_sec)))) {
+       (uuid_data(arg).timeout + uuid_data(arg).active > fio_data->last_cycle.tv_sec));
+  fio_unlock(&uuid_data(arg).protocol_lock);
+  if (skip) {
+    protocol_unlock(pr, FIO_PR_LOCK_WRITE);
     return;
   }
-  fio_protocol_s *pr = protocol_try_lock(fio_uuid2fd(arg), FIO_PR_LOCK_WRITE);
-  if (!pr)
-    goto postpone;
   pr->ping((intptr_t)arg, pr);
   protocol_unlock(pr, FIO_PR_LOCK_WRITE);
   return;
@@ -2921,18 +3007,7 @@ void fio_force_close(intptr_t uuid) {
   if (!uuid_data(uuid).close)
     uuid_data(uuid).close = 1;
   /* clear away any packets in case we want to cut the connection short. */
-  fio_packet_s *packet = NULL;
-  fio_lock(&uuid_data(uuid).sock_lock);
-  packet = uuid_data(uuid).packet;
-  uuid_data(uuid).packet = NULL;
-  uuid_data(uuid).packet_last = &uuid_data(uuid).packet;
-  uuid_data(uuid).sent = 0;
-  fio_unlock(&uuid_data(uuid).sock_lock);
-  while (packet) {
-    fio_packet_s *tmp = packet;
-    packet = packet->next;
-    fio_packet_free(tmp);
-  }
+  fio_discard_pending_packets(uuid);
   /* check for rw-hooks termination packet */
   if (uuid_data(uuid).open && (uuid_data(uuid).close & 1) &&
       uuid_data(uuid).rw_hooks->before_close(uuid, uuid_data(uuid).rw_udata)) {
@@ -3690,13 +3765,14 @@ static void fio_review_timeout(void *arg, void *ignr) {
   fio_protocol_s *tmp;
   time_t review = fio_data->last_cycle.tv_sec;
   intptr_t fd = (intptr_t)arg;
+  const intptr_t uuid = fd2uuid(fd);
 
   uint16_t timeout = fd_data(fd).timeout;
   if (!timeout)
     timeout = 300; /* enforced timout settings */
   if (!fd_data(fd).protocol || (fd_data(fd).active + timeout >= review))
     goto finish;
-  tmp = protocol_try_lock(fd, FIO_PR_LOCK_STATE);
+  tmp = protocol_try_lock(uuid, FIO_PR_LOCK_STATE);
   if (!tmp) {
     if (errno == EBADF)
       goto finish;
@@ -3705,7 +3781,7 @@ static void fio_review_timeout(void *arg, void *ignr) {
   if (prt_meta(tmp).locks[FIO_PR_LOCK_TASK] ||
       prt_meta(tmp).locks[FIO_PR_LOCK_WRITE])
     goto unlock;
-  fio_defer_push_task(deferred_ping, (void *)fio_fd2uuid((int)fd), NULL);
+  fio_defer_push_task(deferred_ping, (void *)uuid, NULL);
 unlock:
   protocol_unlock(tmp, FIO_PR_LOCK_STATE);
 finish:

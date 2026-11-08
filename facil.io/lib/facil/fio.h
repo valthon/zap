@@ -208,6 +208,7 @@ Version and helper macros
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -3186,7 +3187,7 @@ FIO_FUNC inline int fio_ls_embd_any(fio_ls_embd_s *list);
  * Very useful.
  */
 #define FIO_LS_EMBD_OBJ(type, member, plist)                                   \
-  ((type *)((uintptr_t)(plist) - (uintptr_t)(&(((type *)0)->member))))
+  ((type *)((uintptr_t)(plist) - offsetof(type, member)))
 
 /* *****************************************************************************
 Independent Linked List API
