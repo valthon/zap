@@ -169,6 +169,29 @@ pub fn build(b: *std.Build) !void {
     //       we can call it again when needed.
 
     const test_step = b.step("test", "Run unit tests");
+    const poll_snapshot_step = b.step("test-poll-snapshot", "Reject stale events after descriptor reuse");
+    for ([_]bool{ false, true }) |force_poll| {
+        const executable = b.addExecutable(.{
+            .name = if (force_poll) "poll-snapshot-fallback" else "poll-snapshot-native",
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        executable.root_module.addCSourceFile(.{
+            .file = b.path("src/tests/test_poll_snapshot.c"),
+            .flags = if (force_poll)
+                &.{ "-std=c11", "-D_GNU_SOURCE", "-UNDEBUG", "-DFIO_ENGINE_POLL=1" }
+            else
+                &.{ "-std=c11", "-D_GNU_SOURCE", "-UNDEBUG" },
+        });
+        executable.root_module.addIncludePath(b.path("facil.io/lib/facil"));
+        executable.root_module.linkSystemLibrary("pthread", .{});
+        const run = b.addRunArtifact(executable);
+        poll_snapshot_step.dependOn(&run.step);
+    }
+    test_step.dependOn(poll_snapshot_step);
     const test_system = TestSystem{ .b = b, .zap_module = zap_module, .target = target, .optimize = optimize, .combine_test_step = test_step };
     // authentication tests
     test_system.addTest("src/tests/test_auth.zig", "auth");

@@ -27,6 +27,8 @@ jobs:
       # Also, the test runner tries to run tests concurrently, which causes
       # conflicts when port numbers are re-used in the tests (which they aren't
       # anymore)
+      - name: Run poll snapshot regressions
+        run: zig build test-poll-snapshot
       - name: Run mustache tests
         run: zig build test-mustache
       - name: Run httpparams tests
