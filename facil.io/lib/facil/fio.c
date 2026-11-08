@@ -344,9 +344,20 @@ static inline int fio_clear_fd(intptr_t fd, uint8_t is_open) {
 /* A returned poll batch can outlive its connection. Keep the registration's
  * UUID in the event rather than deriving a new UUID from a recycled descriptor.
  * The ownership check also protects descriptors opened outside facil.io. */
-static void fio_discard_pending_packets(intptr_t uuid) {
+static int fio_discard_pending_packets(intptr_t uuid, uint8_t close_marker) {
+  if (!fio_is_valid(uuid)) {
+    errno = EBADF;
+    return -1;
+  }
   fio_packet_s *packet = NULL;
   fio_lock(&uuid_data(uuid).sock_lock);
+  if (!fio_is_valid(uuid) || !uuid_data(uuid).open) {
+    fio_unlock(&uuid_data(uuid).sock_lock);
+    errno = EBADF;
+    return -1;
+  }
+  if (close_marker == 2 || !uuid_data(uuid).close)
+    uuid_data(uuid).close = close_marker;
   packet = uuid_data(uuid).packet;
   uuid_data(uuid).packet = NULL;
   uuid_data(uuid).packet_last = &uuid_data(uuid).packet;
@@ -357,9 +368,10 @@ static void fio_discard_pending_packets(intptr_t uuid) {
     packet = packet->next;
     fio_packet_free(tmp);
   }
+  return 0;
 }
 
-static inline void fio_force_close_in_poll(intptr_t uuid) {
+static void fio_close_final(intptr_t uuid) {
   const intptr_t fd = fio_uuid2fd(uuid);
   if (uuid < 0 || (uintptr_t)fd >= fio_data->capa)
     return;
@@ -370,17 +382,24 @@ static inline void fio_force_close_in_poll(intptr_t uuid) {
     fio_unlock(&fd_data(fd).protocol_lock);
     return;
   }
-  fd_data(fd).close = 2;
-  fio_discard_pending_packets(uuid);
   fio_clear_fd(fd, 0);
+  close(fd);
 #if FIO_ENGINE_POLL
+  fio_lock(&fio_data->lock);
   fio_data->poll[fd].fd = -1;
   fio_data->poll[fd].events = 0;
+  fio_unlock(&fio_data->lock);
 #endif
-  close(fd);
   fio_unlock(&fd_data(fd).protocol_lock);
   if (fio_data->connection_count)
     fio_atomic_sub(&fio_data->connection_count, 1);
+}
+
+/* Abnormal poll errors bypass the transport termination callback. */
+static inline void fio_force_close_in_poll(intptr_t uuid) {
+  /* Free detached packets before the final ownership-checked close. */
+  if (fio_discard_pending_packets(uuid, 2) == 0)
+    fio_close_final(uuid);
 }
 
 /* *****************************************************************************
@@ -2992,11 +3011,19 @@ void fio_close(intptr_t uuid) {
     errno = EBADF;
     return;
   }
+  fio_lock(&uuid_data(uuid).protocol_lock);
+  if (!uuid_is_valid(uuid) || !uuid_data(uuid).open) {
+    fio_unlock(&uuid_data(uuid).protocol_lock);
+    errno = EBADF;
+    return;
+  }
   if (uuid_data(uuid).packet || uuid_data(uuid).sock_lock) {
     uuid_data(uuid).close = 1;
     fio_poll_add_write(fio_uuid2fd(uuid));
+    fio_unlock(&uuid_data(uuid).protocol_lock);
     return;
   }
+  fio_unlock(&uuid_data(uuid).protocol_lock);
   fio_force_close(uuid);
 }
 
@@ -3010,29 +3037,30 @@ void fio_force_close(intptr_t uuid) {
     errno = EBADF;
     return;
   }
-  // FIO_LOG_DEBUG("fio_force_close called for uuid %p", (void *)uuid);
-  /* make sure the close marker is set */
-  if (!uuid_data(uuid).close)
-    uuid_data(uuid).close = 1;
-  /* clear away any packets in case we want to cut the connection short. */
-  fio_discard_pending_packets(uuid);
-  /* check for rw-hooks termination packet */
-  if (uuid_data(uuid).open && (uuid_data(uuid).close & 1) &&
-      uuid_data(uuid).rw_hooks->before_close(uuid, uuid_data(uuid).rw_udata)) {
-    uuid_data(uuid).close = 2; /* don't repeat the before_close callback */
-    fio_touch(uuid);
-    fio_poll_add_write(fio_uuid2fd(uuid));
+  /* Detach packets under the same lock used by generation reset. Free them
+   * outside both slot locks, preserving packet-before-transport callback order. */
+  if (fio_discard_pending_packets(uuid, 1))
+    return;
+  /* R/W hooks cannot call facil.io APIs. Serialize their termination callback
+   * with flushing and revalidate after packet deallocation returned. */
+  fio_lock(&uuid_data(uuid).sock_lock);
+  if (!uuid_is_valid(uuid) || !uuid_data(uuid).open) {
+    fio_unlock(&uuid_data(uuid).sock_lock);
+    errno = EBADF;
     return;
   }
-  fio_lock(&uuid_data(uuid).protocol_lock);
-  fio_clear_fd(fio_uuid2fd(uuid), 0);
-  fio_unlock(&uuid_data(uuid).protocol_lock);
-  close(fio_uuid2fd(uuid));
-#if FIO_ENGINE_POLL
-  fio_poll_remove_fd(fio_uuid2fd(uuid));
-#endif
-  if (fio_data->connection_count)
-    fio_atomic_sub(&fio_data->connection_count, 1);
+  if ((uuid_data(uuid).close & 1) &&
+      uuid_data(uuid).rw_hooks->before_close(uuid, uuid_data(uuid).rw_udata)) {
+    uuid_data(uuid).close = 2;
+    touchfd(fio_uuid2fd(uuid));
+    fio_poll_add_write(fio_uuid2fd(uuid));
+    fio_unlock(&uuid_data(uuid).sock_lock);
+    return;
+  }
+  fio_unlock(&uuid_data(uuid).sock_lock);
+  /* Generation reset, OS close and watcher removal remain one ownership-
+   * checked operation. No old close can clear a newly accepted connection. */
+  fio_close_final(uuid);
 }
 
 /**
@@ -3053,6 +3081,12 @@ ssize_t fio_flush(intptr_t uuid) {
   /* start critical section */
   if (fio_trylock(&uuid_data(uuid).sock_lock))
     goto would_block;
+  /* Clearing and reopening this slot also takes sock_lock. The UUID checked
+   * before acquiring it may therefore belong to the previous connection. */
+  if (!uuid_is_valid(uuid) || !uuid_data(uuid).open) {
+    fio_unlock(&uuid_data(uuid).sock_lock);
+    goto invalid;
+  }
 
   if (!uuid_data(uuid).packet)
     goto flush_rw_hook;
@@ -3074,15 +3108,13 @@ ssize_t fio_flush(intptr_t uuid) {
     goto attacked;
   }
 
-  /* end critical section */
+  /* Capture state before releasing the generation-protecting lock. */
+  const int should_close = !uuid_data(uuid).packet && uuid_data(uuid).close;
+  const int pending = uuid_data(uuid).open && uuid_data(uuid).packet != NULL;
   fio_unlock(&uuid_data(uuid).sock_lock);
-
-  /* test for fio_close marker */
-  if (!uuid_data(uuid).packet && uuid_data(uuid).close)
+  if (should_close)
     goto closed;
-
-  /* return state */
-  return uuid_data(uuid).open && uuid_data(uuid).packet != NULL;
+  return pending;
 
 would_block:
   errno = EWOULDBLOCK;
@@ -3094,14 +3126,12 @@ closed:
 
 flush_rw_hook:
   flushed = uuid_data(uuid).rw_hooks->flush(uuid, uuid_data(uuid).rw_udata);
-  fio_unlock(&uuid_data(uuid).sock_lock);
-  if (!flushed)
-    return 0;
-  if (flushed < 0) {
+  if (flushed < 0)
     goto test_errno;
-  }
-  touchfd(fio_uuid2fd(uuid));
-  return 1;
+  if (flushed)
+    touchfd(fio_uuid2fd(uuid));
+  fio_unlock(&uuid_data(uuid).sock_lock);
+  return flushed != 0;
 
 test_errno:
   fio_unlock(&uuid_data(uuid).sock_lock);
@@ -3124,7 +3154,6 @@ test_errno:
   case EIO:    /* fallthrough */
   case EINVAL: /* fallthrough */
   case EBADF:
-    uuid_data(uuid).close = 1;
     fio_force_close(uuid);
     return -1;
   }
@@ -3142,7 +3171,10 @@ attacked:
   FIO_LOG_WARNING("(facil.io) possible Slowloris attack from %.*s",
                   (int)fio_peer_addr(uuid).len, fio_peer_addr(uuid).data);
   fio_unlock(&uuid_data(uuid).sock_lock);
-  fio_clear_fd(fio_uuid2fd(uuid), 0);
+  fio_lock(&uuid_data(uuid).protocol_lock);
+  if (uuid_is_valid(uuid) && uuid_data(uuid).open)
+    fio_clear_fd(fio_uuid2fd(uuid), 0);
+  fio_unlock(&uuid_data(uuid).protocol_lock);
   return -1;
 }
 
