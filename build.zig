@@ -7,11 +7,11 @@ const TestSystem = struct {
     b: *std.Build,
     zap_module: *std.Build.Module,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     combine_test_step: *std.Build.Step,
 
     pub fn addTest(self: TestSystem, root_src: []const u8, test_name: []const u8) void {
-        const tests_module = self.b.addModule(test_name, .{
+        const tests_module = self.b.createModule(.{
             .root_source_file = self.b.path(root_src),
             .target = self.target,
             .optimize = self.optimize,
@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) !void {
         std.process.exit(1);
     }
     // Standard release options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
+    // between debug, safe, fast, and small.
     const optimize = b.standardOptimizeOption(.{});
 
     const use_openssl = b.option(bool, "openssl", "Use system-installed openssl for TLS support in zap") orelse blk: {
@@ -109,25 +109,22 @@ pub fn build(b: *std.Build) !void {
         const ex_name = excfg.name;
         const ex_src = excfg.src;
 
-        const ex_build_desc = try std.fmt.allocPrint(
-            b.allocator,
+        const ex_build_desc = try b.allocator.print(
             "build the {s} example",
             .{ex_name},
         );
-        const ex_run_stepname = try std.fmt.allocPrint(
-            b.allocator,
+        const ex_run_stepname = try b.allocator.print(
             "run-{s}",
             .{ex_name},
         );
-        const ex_run_stepdesc = try std.fmt.allocPrint(
-            b.allocator,
+        const ex_run_stepdesc = try b.allocator.print(
             "run the {s} example",
             .{ex_name},
         );
         const example_run_step = b.step(ex_run_stepname, ex_run_stepdesc);
         const example_step = b.step(ex_name, ex_build_desc);
 
-        const exe_mod = b.addModule(ex_name, .{
+        const exe_mod = b.createModule(.{
             .root_source_file = b.path(ex_src),
             .target = target,
             .optimize = optimize,
@@ -142,6 +139,7 @@ pub fn build(b: *std.Build) !void {
 
         // const example_run = example.run();
         const example_run = b.addRunArtifact(example);
+        example_run.addPassthruArgs();
         example_run_step.dependOn(&example_run.step);
 
         // install the artifact - depending on the "example"
@@ -193,6 +191,8 @@ pub fn build(b: *std.Build) !void {
     }
     test_step.dependOn(poll_snapshot_step);
     const test_system = TestSystem{ .b = b, .zap_module = zap_module, .target = target, .optimize = optimize, .combine_test_step = test_step };
+    // Callback reflection and tuple forwarding tests
+    test_system.addTest("src/BoundFunction.zig", "bound_function");
     // authentication tests
     test_system.addTest("src/tests/test_auth.zig", "auth");
     // mustache tests
@@ -210,7 +210,7 @@ pub fn build(b: *std.Build) !void {
 
     //
     // docserver
-    const docserver_mod = b.addModule("docserver", .{
+    const docserver_mod = b.createModule(.{
         .root_source_file = b.path("./tools/docserver.zig"),
         .target = target,
         .optimize = optimize,
@@ -227,6 +227,7 @@ pub fn build(b: *std.Build) !void {
 
     const docserver_run_step = b.step("run-docserver", "run the docserver");
     const docserver_run = b.addRunArtifact(docserver_exe);
+    docserver_run.addPassthruArgs();
     docserver_run.addPrefixedDirectoryArg("--docs=", docs_obj.getEmittedDocs());
 
     docserver_run_step.dependOn(&docserver_run.step);
@@ -237,7 +238,7 @@ pub fn build(b: *std.Build) !void {
     //
     // announceybot
     //
-    const announceybot_mod = b.addModule("announceybot", .{
+    const announceybot_mod = b.createModule(.{
         .root_source_file = b.path("./tools/announceybot.zig"),
         .target = target,
         .optimize = optimize,

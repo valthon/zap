@@ -285,7 +285,7 @@ pub const HttpListener = struct {
             .is_client = 0,
         };
         var portbuf: [100]u8 = undefined;
-        const printed_port = try std.fmt.bufPrintZ(&portbuf, "{d}", .{self.settings.port});
+        const printed_port = try std.mem.printSentinel(&portbuf, "{d}", .{self.settings.port}, 0);
 
         const ret = fio.http_listen(printed_port.ptr, self.settings.interface, x);
         if (ret == -1) {

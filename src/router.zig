@@ -92,10 +92,10 @@ pub fn handle_func(self: *Router, path: []const u8, instance: *anyopaque, handle
         };
 
         // 2) snd arg is zap.Request
-        if (f.params.len != 2) {
+        if (f.param_types.len != 2) {
             @compileError("Expected handler to have two paramters");
         }
-        const arg_type = f.params[1].type.?;
+        const arg_type = f.param_types[1].?;
         if (arg_type != zap.Request) {
             @compileError("Expected handler's second argument to be of type zap.Request. Found " ++
                 @typeName(arg_type));

@@ -55,8 +55,7 @@ const ContextManager = struct {
         defer self.lock.unlock(self.io);
 
         const ctx = try self.allocator.create(Context);
-        const userName = try std.fmt.allocPrint(
-            self.allocator,
+        const userName = try self.allocator.print(
             "{s}{d}",
             .{ self.usernamePrefix, self.contexts.items.len },
         );
@@ -91,7 +90,7 @@ fn on_open_websocket(context: ?*Context, handle: WebSockets.WsHandle) !void {
 
         // say hello
         var buf: [128]u8 = undefined;
-        const message = try std.fmt.bufPrint(
+        const message = try std.mem.print(
             &buf,
             "{s} joined the chat.",
             .{ctx.userName},
@@ -108,7 +107,7 @@ fn on_close_websocket(context: ?*Context, uuid: isize) !void {
     if (context) |ctx| {
         // say goodbye
         var buf: [128]u8 = undefined;
-        const message = try std.fmt.bufPrint(
+        const message = try std.mem.print(
             &buf,
             "{s} left the chat.",
             .{ctx.userName},
@@ -146,7 +145,7 @@ fn handle_websocket_message(
             if (message.len > max_msg_len) {
                 trimmed_message = message[0..max_msg_len];
             }
-            const chat_message = try std.fmt.bufPrint(
+            const chat_message = try std.mem.print(
                 &buf,
                 format_string,
                 .{ ctx.userName, trimmed_message },

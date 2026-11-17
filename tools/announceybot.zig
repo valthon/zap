@@ -358,7 +358,7 @@ fn command_update_readme(io: std.Io, allocator: std.mem.Allocator, tag: []const 
         // we need to put the \n back in.
         // TODO: change this by using some "search" iterator that just
         // returns indices etc
-        const output_line = try std.fmt.allocPrint(allocator, "{s}\n", .{line});
+        const output_line = try allocator.print("{s}\n", .{line});
         defer allocator.free(output_line);
         _ = try writer.writeAll(output_line);
     }

@@ -103,7 +103,7 @@ pub const http_s = extern struct {
 //   unsigned http_only : 1;
 // } http_cookie_args_s;
 
-pub const http_cookie_args_s =  extern struct {
+pub const http_cookie_args_s = extern struct {
     name: [*c]u8,
     value: [*c]u8,
     domain: [*c]u8,

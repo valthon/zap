@@ -593,7 +593,7 @@ pub fn UserPassSession(comptime Lookup: type, comptime lockedPwLookups: bool) ty
             hasher.update(password);
             var buf: [16]u8 = undefined;
             const time_nano = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-            const timestampHex = try std.fmt.bufPrint(&buf, "{0x}", .{time_nano});
+            const timestampHex = try std.mem.print(&buf, "{0x}", .{time_nano});
             hasher.update(timestampHex);
 
             var digest: [Hash.digest_length]u8 = undefined;

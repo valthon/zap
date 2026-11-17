@@ -114,7 +114,7 @@ pub fn checkEndpointType(T: type) void {
             }
 
             // now check parameters
-            const params = method_info.@"fn".params;
+            const params = method_info.@"fn".param_types;
             if (params.len != params_to_check.len) {
                 @compileError(std.fmt.comptimePrint(
                     "Expected method `{s}.{s}` to have {d} parameters, got {d}",
@@ -128,7 +128,7 @@ pub fn checkEndpointType(T: type) void {
             }
 
             inline for (params_to_check, 0..) |param_type_expected, i| {
-                if (params[i].type.? != param_type_expected) {
+                if (params[i].? != param_type_expected) {
                     @compileError(std.fmt.comptimePrint(
                         "Expected parameter {d} of method {s}.{s} to be {s}, got {s}",
                         .{
@@ -136,7 +136,7 @@ pub fn checkEndpointType(T: type) void {
                             @typeName(T),
                             method,
                             @typeName(param_type_expected),
-                            @typeName(params[i].type.?),
+                            @typeName(params[i].?),
                         },
                     ));
                 }

@@ -25,7 +25,7 @@ fn makeRequest(allocator: std.mem.Allocator, url: []const u8) !void {
     var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer http_client.deinit();
 
-    const payload_wrong_line_ending = try std.fmt.allocPrint(allocator,
+    const payload_wrong_line_ending = try allocator.print(
         \\--{s}
         \\Content-Disposition: form-data; name="{s}"; filename="{s}"
         \\Content-Type: {s}
@@ -39,8 +39,7 @@ fn makeRequest(allocator: std.mem.Allocator, url: []const u8) !void {
     const payload = try std.mem.replaceOwned(u8, allocator, payload_wrong_line_ending, "\n", "\r\n");
     defer allocator.free(payload);
 
-    const request_content_type = try std.fmt.allocPrint(
-        allocator,
+    const request_content_type = try allocator.print(
         "multipart/form-data; boundary={s}",
         .{BOUNDARY},
     );

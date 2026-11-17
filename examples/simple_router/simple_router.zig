@@ -35,8 +35,7 @@ pub const SomePackage = struct {
     pub fn getA(self: *SomePackage, req: zap.Request) !void {
         std.log.warn("get_a_requested", .{});
 
-        const string = std.fmt.allocPrint(
-            self.allocator,
+        const string = self.allocator.print(
             "A value is {d}\n",
             .{self.a},
         ) catch return;
@@ -48,8 +47,7 @@ pub const SomePackage = struct {
     pub fn getB(self: *SomePackage, req: zap.Request) !void {
         std.log.warn("get_b_requested", .{});
 
-        const string = std.fmt.allocPrint(
-            self.allocator,
+        const string = self.allocator.print(
             "B value is {d}\n",
             .{self.b},
         ) catch return;

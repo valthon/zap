@@ -36,10 +36,11 @@ var dynamic_counter: i32 = 0;
 fn dynamic_site(r: zap.Request) !void {
     dynamic_counter += 1;
     var buf: [128]u8 = undefined;
-    const filled_buf = try std.fmt.bufPrintZ(
+    const filled_buf = try std.mem.printSentinel(
         &buf,
         "<html><body><h1>Hello # {d} from DYNAMIC ZAP!!!</h1></body></html>",
         .{dynamic_counter},
+        0,
     );
     try r.sendBody(filled_buf);
 }
