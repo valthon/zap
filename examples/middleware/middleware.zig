@@ -171,7 +171,7 @@ const HtmlMiddleWare = struct {
                 sessionFound = true;
 
                 std.debug.assert(r.isFinished() == false);
-                const message = std.fmt.bufPrint(&buf, "User: {s} / {s}, Session: {s} / {s}", .{
+                const message = std.mem.print(&buf, "User: {s} / {s}, Session: {s} / {s}", .{
                     user.name,
                     user.email,
                     session.info,
@@ -184,7 +184,7 @@ const HtmlMiddleWare = struct {
             }
         }
 
-        const message = std.fmt.bufPrint(&buf, "User info found: {}, session info found: {}", .{ userFound, sessionFound }) catch unreachable;
+        const message = std.mem.print(&buf, "User info found: {}, session info found: {}", .{ userFound, sessionFound }) catch unreachable;
 
         r.setContentType(.TEXT) catch unreachable;
         r.sendBody(message) catch unreachable;

@@ -339,7 +339,7 @@ pub fn getUserContext(self: *const Request, comptime Context: type) ?*Context {
 /// const err = zap.HttpError; // this is to show that `err` is an Error
 /// r.sendError(err, if (@errorReturnTrace()) |t| t.* else null, 505);
 /// ```
-pub fn sendError(self: *const Request, err: anyerror, err_trace: ?std.builtin.StackTrace, errorcode_num: usize) void {
+pub fn sendError(self: *const Request, err: anyerror, err_trace: ?std.lang.StackTrace, errorcode_num: usize) void {
     // TODO: query accept headers
     if (self._internal_sendError(err, err_trace, errorcode_num)) {
         return;
@@ -349,7 +349,7 @@ pub fn sendError(self: *const Request, err: anyerror, err_trace: ?std.builtin.St
 }
 
 /// Used internally. Probably does not need to be public.
-pub fn _internal_sendError(self: *const Request, err: anyerror, err_trace: ?std.builtin.StackTrace, errorcode_num: usize) !void {
+pub fn _internal_sendError(self: *const Request, err: anyerror, err_trace: ?std.lang.StackTrace, errorcode_num: usize) !void {
     // TODO: query accept headers
     // TODO: let's hope 20k is enough. Maybe just really allocate here
     self.h.*.status = errorcode_num;
@@ -358,7 +358,7 @@ pub fn _internal_sendError(self: *const Request, err: anyerror, err_trace: ?std.
     try writer.print("ERROR: {any}\n\n", .{err});
 
     if (err_trace) |trace| {
-        // Zig 0.16: `@errorReturnTrace()` yields a `std.builtin.StackTrace`,
+        // Zig 0.16: `@errorReturnTrace()` yields a `std.lang.StackTrace`,
         // but `writeStackTrace` now takes a `*const std.debug.StackTrace`.
         const dbg_trace: std.debug.StackTrace = .{
             .return_addresses = trace.instruction_addresses[0..@min(trace.index, trace.instruction_addresses.len)],
@@ -558,7 +558,7 @@ pub fn setStatusNumeric(self: *const Request, status: usize) void {
 
 /// Set status by enum.
 pub fn setStatus(self: *const Request, status: http.StatusCode) void {
-    self.h.*.status = @as(usize, @intCast(@intFromEnum(status)));
+    self.h.*.status = @as(usize, @intCast(@backingInt(status)));
 }
 
 /// Sends a file if present in the filesystem orelse returns an error.

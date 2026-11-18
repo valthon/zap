@@ -48,8 +48,7 @@ const SimpleEndpoint = struct {
 
         // look, we use the arena allocator here -> no need to free the response_text later!
         // and we also just `try` it, not worrying about errors
-        const response_text = try std.fmt.allocPrint(
-            arena,
+        const response_text = try arena.print(
             \\Hello!
             \\context.db_connection: {s}
             \\endpoint.data: {s}

@@ -88,7 +88,7 @@ test "BasicAuth UserPass" {
     try std.testing.expectEqual(auth.authenticate("wrong header"), .AuthFailed);
     try std.testing.expectEqual(auth.authenticate("Basic wrong-token"), .AuthFailed);
     // ok
-    const expected = try std.fmt.allocPrint(a, "Basic {s}", .{encoded});
+    const expected = try a.print("Basic {s}", .{encoded});
 
     defer a.free(expected);
     try std.testing.expectEqual(auth.authenticate(expected), .AuthOK);
@@ -120,7 +120,7 @@ fn makeRequest(a: std.mem.Allocator, url: []const u8, auth: ?ClientAuthReqHeader
     var auth_buf: [256]u8 = undefined;
     const auth_string: []const u8 = blk: {
         if (auth) |auth_fields| {
-            const authstring = try std.fmt.bufPrint(&auth_buf, "{s}{s}", .{ auth_fields.auth.str(), auth_fields.token });
+            const authstring = try std.mem.print(&auth_buf, "{s}{s}", .{ auth_fields.auth.str(), auth_fields.token });
             break :blk authstring;
         } else {
             break :blk "";

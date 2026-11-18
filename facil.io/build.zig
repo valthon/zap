@@ -4,10 +4,10 @@ pub fn build_facilio(
     comptime subdir: []const u8,
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     use_openssl: bool,
 ) !*std.Build.Step.Compile {
-    const mod = b.addModule("facil.io", .{
+    const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -22,7 +22,7 @@ pub fn build_facilio(
     // Generate flags
     var flags = std.ArrayList([]const u8).empty;
     defer flags.deinit(b.allocator);
-    if (optimize != .Debug) try flags.append(b.allocator, "-Os");
+    if (optimize != .debug) try flags.append(b.allocator, "-Os");
     try flags.append(b.allocator, "-Wno-return-type-c-linkage");
     try flags.append(b.allocator, "-fno-sanitize=undefined");
 

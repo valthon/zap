@@ -37,8 +37,7 @@ const MyEndpoint = struct {
     // we use the endpoint, the context, the arena, and try
     pub fn get(ep: *MyEndpoint, arena: Allocator, context: *MyContext, r: zap.Request) !void {
         const used_token = get_bearer_token(r);
-        const response = try std.fmt.allocPrint(
-            arena,
+        const response = try arena.print(
             HTTP_RESPONSE_TEMPLATE,
             .{ "Hello", ep.path, used_token, context.bearer_token, "OK" },
         );
@@ -51,8 +50,7 @@ const MyEndpoint = struct {
     pub fn unauthorized(ep: *MyEndpoint, arena: Allocator, context: *MyContext, r: zap.Request) !void {
         r.setStatus(.unauthorized);
         const used_token = get_bearer_token(r);
-        const response = try std.fmt.allocPrint(
-            arena,
+        const response = try arena.print(
             HTTP_RESPONSE_TEMPLATE,
             .{ "UNAUTHORIZED", ep.path, used_token, context.bearer_token, "NOT OK" },
         );
