@@ -203,6 +203,8 @@ pub fn build(b: *std.Build) !void {
     test_system.addTest("src/tests/test_sendfile.zig", "sendfile");
     test_system.addTest("src/tests/test_recvfile.zig", "recv");
     test_system.addTest("src/tests/test_recvfile_notype.zig", "recv_notype");
+    // request bodies spilled to temp files
+    test_system.addTest("src/tests/test_large_body.zig", "large_body");
     // TODO: for some reason, tests aren't run more than once unless
     //       dependencies have changed.
     //       So, for now, we just force the exe to be built, so in order that
